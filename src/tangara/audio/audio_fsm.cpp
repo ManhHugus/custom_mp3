@@ -1,0 +1,670 @@
+/*
+ * Copyright 2023 jacqueline <me@jacqueline.id.au>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+#include "audio/audio_fsm.hpp"
+
+#include <cstdint>
+#include <future>
+#include <memory>
+#include <sstream>
+#include <variant>
+
+#include "audio/audio_source.hpp"
+#include "audio/sine_source.hpp"
+#include "cppbor.h"
+#include "cppbor_parse.h"
+#include "drivers/pcm_buffer.hpp"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
+#include "freertos/projdefs.h"
+#include "tinyfsm.hpp"
+
+#include "audio/audio_decoder.hpp"
+#include "audio/audio_events.hpp"
+#include "audio/audio_sink.hpp"
+#include "audio/bt_audio_output.hpp"
+#include "audio/fatfs_stream_factory.hpp"
+#include "audio/i2s_audio_output.hpp"
+#include "audio/stream_cues.hpp"
+#include "audio/track_queue.hpp"
+#include "database/future_fetcher.hpp"
+#include "database/track.hpp"
+#include "drivers/bluetooth.hpp"
+#include "drivers/bluetooth_types.hpp"
+#include "drivers/i2s_dac.hpp"
+#include "drivers/nvs.hpp"
+#include "drivers/storage.hpp"
+#include "drivers/wm8523.hpp"
+#include "events/event_queue.hpp"
+#include "sample.hpp"
+#include "system_fsm/service_locator.hpp"
+#include "system_fsm/system_events.hpp"
+#include "tts/player.hpp"
+
+namespace audio {
+
+[[maybe_unused]] static const char kTag[] = "audio_fsm";
+
+static const char kQueueKey[] = "audio:queue";
+static const char kCurrentFileKey[] = "audio:current";
+
+std::shared_ptr<system_fsm::ServiceLocator> AudioState::sServices;
+
+std::shared_ptr<FatfsStreamFactory> AudioState::sStreamFactory;
+
+std::unique_ptr<Decoder> AudioState::sDecoder;
+std::shared_ptr<SampleProcessor> AudioState::sSampleProcessor;
+
+std::shared_ptr<IAudioOutput> AudioState::sOutput;
+std::shared_ptr<I2SAudioOutput> AudioState::sI2SOutput;
+std::shared_ptr<BluetoothAudioOutput> AudioState::sBtOutput;
+
+// CPU processing is generally not the bottleneck for audio; reading from the SD card is.
+// Therefore these buffers can be relatively small, whereas ReadaheadSource's buffer
+// is as big as possible.
+constexpr size_t kTrackDrainLatencySamples = drivers::kI2SBufferLengthFrames * 2 * 32;
+constexpr size_t kSystemDrainLatencySamples = drivers::kI2SBufferLengthFrames * 2 * 8;
+
+std::unique_ptr<drivers::OutputBuffers> AudioState::sDrainBuffers;
+std::optional<IAudioOutput::Format> AudioState::sDrainFormat;
+
+StreamCues AudioState::sStreamCues;
+
+bool AudioState::sIsPaused = true;
+bool AudioState::sIsTtsPlaying = false;
+
+uint8_t AudioState::sUpdateCounter = 0;
+
+auto AudioState::emitPlaybackUpdate(bool paused) -> void {
+  std::optional<uint32_t> position;
+  auto current = sStreamCues.current();
+  if (current.first && sDrainFormat) {
+    position = ((current.second +
+                 (sDrainFormat->num_channels * sDrainFormat->sample_rate / 2)) /
+                (sDrainFormat->num_channels * sDrainFormat->sample_rate)) +
+               current.first->start_offset.value_or(0);
+  }
+
+  // If we've got an elapsed duration and it's more than 5 minutes
+  // increment a counter. Every 60 counts (ie, every minute) save the current
+  // elapsed position
+  if (position && *position > (5 * 60)) {
+    sUpdateCounter++;
+    if (sUpdateCounter >= 60) {
+      sUpdateCounter = 0;
+      updateSavedPosition(current.first->uri, *position);
+    }
+  }
+
+  PlaybackUpdate event{
+      .current_track = current.first,
+      .track_position = position,
+      .paused = paused,
+  };
+
+  events::System().Dispatch(event);
+  events::Ui().Dispatch(event);
+}
+
+auto AudioState::loadQueue() -> void {
+  sServices->bg_worker().Dispatch<void>([]() {
+    auto db = sServices->database().lock();
+    if (!db) {
+      return;
+    }
+
+    // Open the queue file
+    sServices->track_queue().open();
+
+    // Restore the currently playing file before restoring the queue. This way,
+    // we can fall back to restarting the queue's current track if there's any
+    // issue restoring the current file.
+    auto current = db->get(kCurrentFileKey);
+    if (current) {
+      // Again, ensure we don't boot-loop by trying to play a track that causes
+      // a crash over and over again.
+      db->put(kCurrentFileKey, "");
+      auto [parsed, unused, err] = cppbor::parse(
+          reinterpret_cast<uint8_t*>(current->data()), current->size());
+      if (parsed->type() == cppbor::ARRAY) {
+        std::string filename = parsed->asArray()->get(0)->asTstr()->value();
+        uint32_t pos = parsed->asArray()->get(1)->asUint()->value();
+
+        events::Audio().Dispatch(SetTrack{
+            .new_track = filename,
+            .seek_to_second = pos,
+        });
+      }
+    }
+
+    auto queue = db->get(kQueueKey);
+    if (queue) {
+      // Don't restore the same queue again. This ideally should do nothing,
+      // but guards against bad edge cases where restoring the queue ends up
+      // causing a crash.
+      db->put(kQueueKey, "");
+      sServices->track_queue().deserialise(*queue);
+    }
+  });
+}
+
+void AudioState::react(const QueueUpdate& ev) {
+  SetTrack cmd{
+      .new_track = std::monostate{},
+      .seek_to_second = ev.seek_to_second,
+  };
+
+  auto current = sServices->track_queue().current();
+  cmd.new_track = current;
+
+  switch (ev.reason) {
+    case QueueUpdate::kExplicitUpdate:
+      if (!ev.current_changed) {
+        return;
+      }
+      break;
+    case QueueUpdate::kRepeatingLastTrack:
+      break;
+    case QueueUpdate::kTrackFinished:
+      if (!ev.current_changed) {
+        cmd.new_track = std::monostate{};
+      }
+      break;
+    case QueueUpdate::kBulkLoadingUpdate:
+      // Bulk loading updates are informational only; a separate QueueUpdate
+      // event will be sent when loading is done.
+    case QueueUpdate::kDeserialised:
+      // The current track is deserialised separately in order to retain seek
+      // position.
+    default:
+      return;
+  }
+
+  tinyfsm::FsmList<AudioState>::dispatch(cmd);
+}
+
+void AudioState::react(const SetTrack& ev) {
+  if (std::holds_alternative<std::monostate>(ev.new_track)) {
+    sDecoder->open({});
+    return;
+  }
+
+  // Move the rest of the work to a background worker, since it may require db
+  // lookups to resolve a track id into a path.
+  auto new_track = ev.new_track;
+  uint32_t seek_to = ev.seek_to_second.value_or(0);
+  sServices->bg_worker().Dispatch<void>([=]() {
+    std::shared_ptr<TaggedStream> stream;
+    if (std::holds_alternative<database::TrackId>(new_track)) {
+      stream = sStreamFactory->create(std::get<database::TrackId>(new_track),
+                                      seek_to);
+    } else if (std::holds_alternative<std::string>(new_track)) {
+      stream =
+          sStreamFactory->create(std::get<std::string>(new_track), seek_to);
+    }
+
+    // Always give the stream to the decoder, even if it turns out to be empty.
+    // This has the effect of stopping the current playback, which is generally
+    // what the user expects to happen when they say "Play this track!", even
+    // if the new track has an issue.
+    sDecoder->open(stream);
+
+    // ...but if the stream that failed is the front of the queue, then we
+    // should advance to the next track in order to keep the tunes flowing.
+    if (!stream) {
+      auto& queue = sServices->track_queue();
+      if (new_track == queue.current()) {
+        queue.finish();
+      }
+    }
+  });
+}
+
+void AudioState::react(const PlaySineWave& ev) {
+  auto tags = std::make_shared<database::TrackTags>();
+
+  std::stringstream title;
+  title << ev.frequency << "Hz Sine Wave";
+  tags->title(title.str());
+
+  sDecoder->open(std::make_shared<TaggedStream>(
+      tags, std::make_unique<SineSource>(ev.frequency), title.str()));
+}
+
+void AudioState::react(const TogglePlayPause& ev) {
+  sIsPaused = !ev.set_to.value_or(sIsPaused);
+  if (!sIsPaused && is_in_state<states::Standby>() &&
+      sStreamCues.current().first) {
+    transit<states::Playback>();
+  } else if (sIsPaused && is_in_state<states::Playback>()) {
+    transit<states::Standby>();
+  }
+}
+
+void AudioState::react(const TtsPlaybackChanged& ev) {
+  sIsTtsPlaying = ev.is_playing;
+  updateOutputMode();
+}
+
+void AudioState::react(const internal::DecodingFinished& ev) {
+  ESP_LOGD(kTag, "end of file decoded; awaiting playback of buffered audio");
+  // If we just finished playing whatever's at the front of the queue, then we
+  // need to advanve and start playing the next one ASAP in order to continue
+  // gaplessly.
+  sServices->bg_worker().Dispatch<void>([=]() {
+    auto& queue = sServices->track_queue();
+    auto current = queue.current();
+    if (std::holds_alternative<std::monostate>(current)) {
+      return;
+    }
+    auto db = sServices->database().lock();
+    if (!db) {
+      return;
+    }
+    std::string path;
+    if (std::holds_alternative<std::string>(current)) {
+      path = std::get<std::string>(current);
+    } else if (std::holds_alternative<database::TrackId>(current)) {
+      auto tid = std::get<database::TrackId>(current);
+      path = db->getTrackPath(tid).value_or("");
+    }
+    if (path == ev.track->uri) {
+      queue.finish();
+      incrementPlayCount(ev.track->uri);
+    }
+  });
+}
+
+void AudioState::react(const internal::StreamStarted& ev) {
+  if (sDrainFormat != ev.sink_format) {
+    sDrainFormat = ev.sink_format;
+    ESP_LOGI(kTag, "sink_format=%u ch @ %lu hz", sDrainFormat->num_channels,
+             sDrainFormat->sample_rate);
+  }
+
+  sStreamCues.addCue(ev.track, ev.cue_at_sample);
+  sStreamCues.update(sDrainBuffers->first.totalReceived());
+
+  if (!sIsPaused && !is_in_state<states::Playback>()) {
+    transit<states::Playback>();
+  } else {
+    // Make sure everyone knows we've got a track ready to go, even if we're
+    // not playing it yet. This mostly matters when restoring the queue from
+    // disk after booting.
+    emitPlaybackUpdate(true);
+  }
+}
+
+void AudioState::react(const internal::StreamEnded& ev) {
+  sStreamCues.addCue({}, ev.cue_at_sample);
+}
+
+void AudioState::react(const system_fsm::HasPhonesChanged& ev) {
+  if (ev.has_headphones) {
+    events::Audio().Dispatch(audio::OutputModeChanged{
+        .set_to = drivers::NvsStorage::Output::kHeadphones});
+  } else {
+    if (sServices->bluetooth().enabled()) {
+      events::Audio().Dispatch(audio::OutputModeChanged{
+          .set_to = drivers::NvsStorage::Output::kBluetooth});
+    } else {
+      // Nothing connected
+      transit<states::Standby>();
+    }
+  }
+}
+
+void AudioState::react(const system_fsm::BluetoothEvent& ev) {
+  using drivers::bluetooth::SimpleEvent;
+  if (std::holds_alternative<SimpleEvent>(ev.event)) {
+    auto simpleEvent = std::get<SimpleEvent>(ev.event);
+    switch (simpleEvent) {
+      case SimpleEvent::kConnectionStateChanged: {
+        auto bt = sServices->bluetooth();
+        if (bt.connectionState() !=
+            drivers::Bluetooth::ConnectionState::kConnected) {
+          // If BT Disconnected, move to standby state
+          if (sOutput == sBtOutput) {
+            events::Audio().Dispatch(audio::OutputModeChanged{
+                .set_to = drivers::NvsStorage::Output::kHeadphones});
+            transit<states::Standby>();
+          }
+          return;
+        }
+        auto dev = sServices->bluetooth().pairedDevice();
+        if (!dev) {
+          return;
+        }
+        events::Audio().Dispatch(audio::OutputModeChanged{
+            .set_to = drivers::NvsStorage::Output::kBluetooth});
+        sBtOutput->SetVolume(sServices->nvs().BluetoothVolume(dev->mac));
+        events::Ui().Dispatch(VolumeChanged{
+            .percent = sOutput->GetVolumePct(),
+            .db = sOutput->GetVolumeDb(),
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  if (std::holds_alternative<drivers::bluetooth::RemoteVolumeChanged>(
+          ev.event)) {
+    auto volume_chg =
+        std::get<drivers::bluetooth::RemoteVolumeChanged>(ev.event).new_vol;
+    events::Ui().Dispatch(RemoteVolumeChanged{.value = volume_chg});
+  }
+}
+
+void AudioState::react(const StepUpVolume& ev) {
+  if (sOutput->AdjustVolumeUp()) {
+    commitVolume();
+    events::Ui().Dispatch(VolumeChanged{
+        .percent = sOutput->GetVolumePct(),
+        .db = sOutput->GetVolumeDb(),
+    });
+  }
+}
+
+void AudioState::react(const StepDownVolume& ev) {
+  if (sOutput->AdjustVolumeDown()) {
+    commitVolume();
+    events::Ui().Dispatch(VolumeChanged{
+        .percent = sOutput->GetVolumePct(),
+        .db = sOutput->GetVolumeDb(),
+    });
+  }
+}
+
+void AudioState::react(const SetVolume& ev) {
+  if (ev.db.has_value()) {
+    if (sOutput->SetVolumeDb(ev.db.value())) {
+      commitVolume();
+      events::Ui().Dispatch(VolumeChanged{
+          .percent = sOutput->GetVolumePct(),
+          .db = sOutput->GetVolumeDb(),
+      });
+    }
+
+  } else if (ev.percent.has_value()) {
+    if (sOutput->SetVolumePct(ev.percent.value())) {
+      commitVolume();
+      events::Ui().Dispatch(VolumeChanged{
+          .percent = sOutput->GetVolumePct(),
+          .db = sOutput->GetVolumeDb(),
+      });
+    }
+  }
+}
+
+void AudioState::react(const SetVolumeLimit& ev) {
+  uint16_t limit_in_dac_units =
+      drivers::wm8523::kLineLevelReferenceVolume + (ev.limit_db * 4);
+
+  sI2SOutput->SetMaxVolume(limit_in_dac_units);
+  sServices->nvs().AmpMaxVolume(limit_in_dac_units);
+
+  events::Ui().Dispatch(VolumeLimitChanged{
+      .new_limit_db = ev.limit_db,
+  });
+  events::Ui().Dispatch(VolumeChanged{
+      .percent = sOutput->GetVolumePct(),
+      .db = sOutput->GetVolumeDb(),
+  });
+}
+
+void AudioState::react(const SetVolumeBalance& ev) {
+  sOutput->SetVolumeImbalance(ev.left_bias);
+  sServices->nvs().AmpLeftBias(ev.left_bias);
+
+  events::Ui().Dispatch(VolumeBalanceChanged{
+      .left_bias = ev.left_bias,
+  });
+}
+
+void AudioState::react(const OutputModeChanged& ev) {
+  ESP_LOGI(kTag, "output mode changed");
+  auto new_mode = sServices->nvs().OutputMode();
+  if (ev.set_to) {
+    new_mode = *ev.set_to;
+  }
+  std::shared_ptr<IAudioOutput> new_output;
+  switch (new_mode) {
+    case drivers::NvsStorage::Output::kBluetooth:
+      new_output = sBtOutput;
+      break;
+    case drivers::NvsStorage::Output::kHeadphones:
+      new_output = sI2SOutput;
+      break;
+  }
+  if (new_output == sOutput) {
+    return;
+  }
+  sOutput->mode(IAudioOutput::Modes::kOff);
+  sOutput = new_output;
+  sSampleProcessor->SetOutput(sOutput);
+  updateOutputMode();
+
+  // Bluetooth volume isn't 'changed' until we've connected to a device.
+  if (new_mode == drivers::NvsStorage::Output::kHeadphones) {
+    events::Ui().Dispatch(VolumeChanged{
+        .percent = sOutput->GetVolumePct(),
+        .db = sOutput->GetVolumeDb(),
+    });
+  }
+}
+
+auto AudioState::updateTrackData(std::string uri,
+                                 std::function<void(database::TrackData&)> fn)
+    -> void {
+  sServices->bg_worker().Dispatch<void>([=]() {
+    auto db = sServices->database().lock();
+    if (!db) {
+      return;
+    }
+    auto id = db->getTrackID(uri);
+    if (!id) {
+      return;
+    }
+    auto track = db->getTrack(*id);
+    if (!track) {
+      return;
+    }
+    auto data = track->data().clone();
+    std::invoke(fn, *data);
+    db->setTrackData(*id, *data);
+  });
+}
+
+auto AudioState::updateSavedPosition(std::string uri,
+                                     uint32_t position) -> void {
+  updateTrackData(
+      uri, [=](database::TrackData& data) { data.last_position = position; });
+}
+
+auto AudioState::incrementPlayCount(std::string uri) -> void {
+  updateTrackData(uri, [&](database::TrackData& data) { data.play_count++; });
+}
+
+auto AudioState::updateOutputMode() -> void {
+  if (is_in_state<states::Playback>() || sIsTtsPlaying) {
+    sOutput->mode(IAudioOutput::Modes::kOnPlaying);
+  } else {
+    sOutput->mode(IAudioOutput::Modes::kOnPaused);
+  }
+}
+
+auto AudioState::commitVolume() -> void {
+  auto mode = sServices->nvs().OutputMode();
+  auto vol = sOutput->GetVolume();
+  if (mode == drivers::NvsStorage::Output::kHeadphones) {
+    sServices->nvs().AmpCurrentVolume(vol);
+  } else if (mode == drivers::NvsStorage::Output::kBluetooth) {
+    auto dev = sServices->bluetooth().pairedDevice();
+    if (!dev) {
+      return;
+    }
+    sServices->nvs().BluetoothVolume(dev->mac, vol);
+  }
+}
+
+namespace states {
+
+void Uninitialised::react(const system_fsm::BootComplete& ev) {
+  sServices = ev.services;
+
+  sDrainBuffers = std::make_unique<drivers::OutputBuffers>(
+      kTrackDrainLatencySamples, kSystemDrainLatencySamples);
+  sDrainBuffers->first.suspend(true);
+
+  sStreamFactory.reset(
+      new FatfsStreamFactory(sServices->database(), sServices->tag_parser(), sServices->readahead_runner()));
+  sI2SOutput.reset(new I2SAudioOutput(sServices->gpios(), *sDrainBuffers));
+  sBtOutput.reset(new BluetoothAudioOutput(
+      sServices->bluetooth(), *sDrainBuffers, sServices->bg_worker()));
+
+  auto& tts_provider = sServices->tts();
+  auto tts_player = std::make_unique<tts::Player>(
+      sServices->bg_worker(), sDrainBuffers->second, *sStreamFactory);
+  tts_provider.player(std::move(tts_player));
+
+  auto& nvs = sServices->nvs();
+  sI2SOutput->SetMaxVolume(nvs.AmpMaxVolume());
+  sI2SOutput->SetVolume(nvs.AmpCurrentVolume());
+  sI2SOutput->SetVolumeImbalance(nvs.AmpLeftBias());
+
+  // Always set to headphones output initially
+  // Connecting bluetooth will change this
+  sOutput = sI2SOutput;
+  if (sServices->nvs().OutputMode() ==
+      drivers::NvsStorage::Output::kBluetooth) {
+    // Ensure Bluetooth gets enabled if it's the default sink.
+    sServices->bluetooth().enable(true);
+  }
+  sOutput->mode(IAudioOutput::Modes::kOnPaused);
+
+  events::Ui().Dispatch(VolumeLimitChanged{
+      .new_limit_db =
+          (static_cast<int>(nvs.AmpMaxVolume()) -
+           static_cast<int>(drivers::wm8523::kLineLevelReferenceVolume)) /
+          4,
+  });
+  events::Ui().Dispatch(VolumeChanged{
+      .percent = sOutput->GetVolumePct(),
+      .db = sOutput->GetVolumeDb(),
+  });
+  events::Ui().Dispatch(VolumeBalanceChanged{
+      .left_bias = nvs.AmpLeftBias(),
+  });
+
+  sSampleProcessor.reset(new SampleProcessor(sDrainBuffers->first));
+  sSampleProcessor->SetOutput(sOutput);
+
+  sDecoder.reset(Decoder::Start(sSampleProcessor));
+
+  // If the sd card is already mounted, load the queue here
+  auto sdState = sServices->sd();
+  if (sdState == drivers::SdState::kMounted) {
+    loadQueue();
+  }
+
+  transit<Standby>();
+}
+
+auto Standby::entry() -> void {
+  updateOutputMode();
+}
+
+void Standby::react(const system_fsm::UnmountRequest& ev) {
+  auto current = sStreamCues.current();
+  sServices->bg_worker().Dispatch<void>([=]() {
+    auto db = sServices->database().lock();
+    if (!db) {
+      events::System().Dispatch(UnmountReady{.idle = ev.idle});
+      return;
+    }
+    auto& queue = sServices->track_queue();
+    if (queue.totalSize() <= queue.currentPosition()) {
+      // Nothing is playing, so don't bother saving the queue.
+      db->put(kQueueKey, "");
+      events::System().Dispatch(UnmountReady{.idle = ev.idle});
+      return;
+    }
+    db->put(kQueueKey, queue.serialise());
+
+    if (current.first && sDrainFormat) {
+      uint32_t seconds = (current.second / (sDrainFormat->num_channels *
+                                            sDrainFormat->sample_rate)) +
+                         current.first->start_offset.value_or(0);
+      cppbor::Array current_track{
+          cppbor::Tstr{current.first->uri},
+          cppbor::Uint{seconds},
+      };
+      db->put(kCurrentFileKey, current_track.toString());
+    }
+    events::System().Dispatch(UnmountReady{.idle = ev.idle});
+  });
+}
+
+void Standby::react(const system_fsm::SdStateChanged& ev) {
+  auto state = sServices->sd();
+  if (state != drivers::SdState::kMounted) {
+    return;
+  }
+  loadQueue();
+}
+
+static TimerHandle_t sHeartbeatTimer;
+
+static void heartbeat(TimerHandle_t) {
+  events::Audio().Dispatch(internal::StreamHeartbeat{});
+}
+
+void Playback::entry() {
+  ESP_LOGI(kTag, "audio output resumed");
+  sDrainBuffers->first.suspend(false);
+  updateOutputMode();
+  emitPlaybackUpdate(false);
+
+  if (!sHeartbeatTimer) {
+    sHeartbeatTimer =
+        xTimerCreate("stream", pdMS_TO_TICKS(1000), true, NULL, heartbeat);
+  }
+  xTimerStart(sHeartbeatTimer, portMAX_DELAY);
+}
+
+void Playback::exit() {
+  ESP_LOGI(kTag, "audio output paused");
+  xTimerStop(sHeartbeatTimer, portMAX_DELAY);
+  sDrainBuffers->first.suspend(true);
+  emitPlaybackUpdate(true);
+}
+
+void Playback::react(const system_fsm::SdStateChanged& ev) {
+  if (sServices->sd() != drivers::SdState::kMounted) {
+    transit<Standby>();
+  }
+}
+
+void Playback::react(const internal::StreamHeartbeat& ev) {
+  sStreamCues.update(sDrainBuffers->first.totalReceived());
+
+  if (sStreamCues.hasStream()) {
+    emitPlaybackUpdate(false);
+  } else {
+    // Finished the current stream, and there's nothing upcoming. We must be
+    // finished.
+    transit<Standby>();
+  }
+}
+
+}  // namespace states
+
+}  // namespace audio
+
+FSM_INITIAL_STATE(audio::AudioState, audio::states::Uninitialised)

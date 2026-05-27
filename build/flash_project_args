@@ -1,0 +1,8 @@
+--flash-mode dio --flash-freq 80m --flash-size detect
+0x1000 bootloader/bootloader.bin
+0x8000 partition_table/partition-table.bin
+0xd000 ota_data_initial.bin
+0x10000 mp3_esp32_fw.bin
+0x810000 ../tools/collate/Generic.LC_COLLATE
+0xb10000 lua.bin
+0xf10000 repl.bin

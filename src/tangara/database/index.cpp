@@ -1,0 +1,309 @@
+/*
+ * Copyright 2023 jacqueline <me@jacqueline.id.au>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+#include "database/index.hpp"
+#include <cstdint>
+
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <variant>
+#include <vector>
+#include <filesystem>
+
+#include "collation.hpp"
+#include "cppbor.h"
+#include "esp_log.h"
+#include "komihash.h"
+#include "leveldb/write_batch.h"
+
+#include "database/records.hpp"
+#include "database/track.hpp"
+
+namespace database {
+
+[[maybe_unused]] static const char* kTag = "index";
+
+const IndexInfo kAlbumsByArtist{
+    .id = 1,
+    .type = MediaType::kMusic,
+    .name = "Albums by Artist",
+    .components = {Tag::kAlbumArtist, Tag::kAlbum, Tag::kAlbumOrder},
+};
+
+const IndexInfo kTracksByGenre{
+    .id = 2,
+    .type = MediaType::kMusic,
+    .name = "Tracks by Genre",
+    .components = {Tag::kGenres, Tag::kTitle},
+};
+
+const IndexInfo kAllTracks{
+    .id = 3,
+    .type = MediaType::kMusic,
+    .name = "All Tracks",
+    .components = {Tag::kTitle},
+};
+
+const IndexInfo kAllAlbums{
+    .id = 4,
+    .type = MediaType::kMusic,
+    .name = "All Albums",
+    .components = {Tag::kAlbum, Tag::kAlbumOrder},
+};
+
+const IndexInfo kAllArtists{
+    .id = 5,
+    .type = MediaType::kMusic,
+    .name = "All Artists",
+    .components = {Tag::kAllArtists, Tag::kTitle},
+};
+
+const IndexInfo kPodcasts{
+    .id = 6,
+    .type = MediaType::kPodcast,
+    .name = "Podcasts",
+    .components = {Tag::kAlbum, Tag::kTitle},
+};
+
+const IndexInfo kAudiobooks{
+    .id = 7,
+    .type = MediaType::kAudiobook,
+    .name = "Audiobooks",
+    .components = {Tag::kAlbum, Tag::kAlbumOrder},
+};
+
+const IndexInfo kTracksByDirectory{
+    .id = 8,
+    .type = MediaType::kAny,
+    .name = "Tracks By Directory",
+    .components = {Tag::kDirectories, Tag::kFilename},
+};
+
+static auto filename(const TrackData& data) -> std::pmr::string {
+  std::filesystem::path path(data.filepath);
+  auto name =  std::pmr::string{path.filename().string()};
+  return name;
+}
+
+static auto directories(const TrackData& data) -> std::pmr::vector<std::pmr::string> {
+  std::pmr::vector<std::pmr::string> dirs = {};
+  std::filesystem::path path(data.filepath);
+  if (path.has_parent_path()) {
+    std::stringstream stream(path.parent_path());
+    std::string segment;
+    while(std::getline(stream, segment, '/'))
+    {
+      if (segment.size() > 0) {
+        dirs.push_back(std::pmr::string{segment});
+      }
+    }
+  }
+  return dirs;
+}
+
+
+static auto titleOrFilename(const TrackData& data,
+                            const TrackTags& tags) -> std::pmr::string {
+  auto title = tags.title();
+  if (title) {
+    return *title;
+  }
+  auto name = filename(data);
+  return name;
+}
+
+class Indexer {
+ public:
+  Indexer(locale::ICollator& collator,
+          const IndexInfo& idx,
+          const TrackData& data,
+          const TrackTags& tags)
+      : collator_(collator),
+        index_(idx),
+        track_data_(data),
+        track_tags_(tags) {}
+
+  auto index() -> std::vector<std::pair<IndexKey, std::string>>;
+
+ private:
+  auto handleLevel(const IndexKey::Header& header,
+                   std::span<const Tag> components) -> void;
+
+  auto handleItem(const IndexKey::Header& header,
+                  std::variant<std::pmr::string, uint32_t, std::span<const std::pmr::string>> item,
+                  std::span<const Tag> components) -> void;
+
+  auto missing_value(Tag tag) -> TagValue {
+    switch (tag) {
+      case Tag::kTitle:
+        return titleOrFilename(track_data_, track_tags_);
+      case Tag::kArtist:
+      case Tag::kAlbumArtist:
+        return "Unknown Artist";
+      case Tag::kAlbum:
+        return "Unknown Album";
+      case Tag::kAllArtists:
+        return std::pmr::vector<std::pmr::string>{};
+      case Tag::kGenres:
+        return std::pmr::vector<std::pmr::string>{};
+      case Tag::kDisc:
+        return 0u;
+      case Tag::kTrack:
+        return 0u;
+      case Tag::kAlbumOrder:
+        return 0u;
+      case Tag::kFilepath:
+        return track_data_.filepath;
+      case Tag::kFilename:
+        return filename(track_data_);
+      case Tag::kDirectories:
+        return directories(track_data_);
+    }
+    return std::monostate{};
+  }
+
+  locale::ICollator& collator_;
+  const IndexInfo index_;
+  const TrackData& track_data_;
+  const TrackTags& track_tags_;
+
+  std::vector<std::pair<IndexKey, std::string>> out_;
+};
+
+auto Indexer::index() -> std::vector<std::pair<IndexKey, std::string>> {
+  out_.clear();
+
+  IndexKey::Header root_header{
+      .id = index_.id,
+      .components_hash = {},
+  };
+  handleLevel(root_header, index_.components);
+
+  return out_;
+}
+
+auto Indexer::handleLevel(const IndexKey::Header& header,
+                          std::span<const Tag> components) -> void {
+  Tag component = components.front();
+  TagValue value = track_tags_.get(component);
+  if (std::holds_alternative<std::monostate>(value)) {
+    value = missing_value(component);
+  }
+
+  std::visit(
+      [&](auto&& arg) {
+        using T = std::decay_t<decltype(arg)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+          ESP_LOGW(kTag, "dropping component without value: %s",
+                   tagName(components.front()).c_str());
+        } else if constexpr (std::is_same_v<T, std::pmr::string>) {
+          handleItem(header, arg, components);
+        } else if constexpr (std::is_same_v<T, uint32_t>) {
+          handleItem(header, arg, components);
+        } else if constexpr (std::is_same_v<
+                                 T, std::span<const std::pmr::string>>) {
+          if (component == Tag::kDirectories) {
+            // Directory indexes should create a new level
+            // for each subdirectory
+            // ie (/foo/bar/track.mp3 should create foo, foo/bar, foo/bar/track.mp3)
+            std::vector<std::pmr::string> dirs = {};
+            for (const auto& i : arg) {
+              dirs.push_back(std::pmr::string{i.data(), i.size()});
+            }
+            handleItem(header, dirs, components);
+          } else {
+            // Otherwise, create individual levels
+            for (const auto& i : arg) {
+              handleItem(header, i, components);
+            }
+          }
+        }
+      },
+      value);
+}
+
+auto Indexer::handleItem(const IndexKey::Header& header,
+                         std::variant<std::pmr::string, uint32_t, std::span<const std::pmr::string>> item,
+                         std::span<const Tag> components) -> void {
+  IndexKey key{
+      .header = header,
+      .item = {},
+      .track = {},
+  };
+  std::string value;
+
+  std::string item_text;
+  std::visit(
+      [&](auto&& arg) {
+        using T = std::decay_t<decltype(arg)>;
+        if constexpr (std::is_same_v<T, std::pmr::string>) {
+          value = {arg.data(), arg.size()};
+          auto xfrm = collator_.Transform(value);
+          key.item = {xfrm.data(), xfrm.size()};
+        } else if constexpr (std::is_same_v<T, uint32_t>) {
+          // CBOR's varint encoding actually works great for lexicographical
+          // sorting.
+          key.item = cppbor::Uint{arg}.toString();
+        } else if constexpr (std::is_same_v<T, std::span<const std::pmr::string>>) {
+          // If an item is a span, then create nested entries
+          IndexKey::Header prevHeader = key.header;
+          for (const auto& i : arg) {
+            value = {i.data(), i.size()};
+            auto xfrm = collator_.Transform(value);
+            key.item = {xfrm.data(), xfrm.size()};
+            out_.emplace_back(key, value);
+            prevHeader = key.header;
+            key.header = ExpandHeader(key.header, key.item);
+          }
+          // The last one should get handled normally
+          key.header = prevHeader;
+        }
+      },
+      item);
+
+  std::optional<IndexKey::Header> next_level;
+  if (components.size() == 1) {
+    if (components[0] == Tag::kFilename) {
+      value = filename(track_data_);
+    } else {
+      value = titleOrFilename(track_data_, track_tags_);
+    }
+    key.track = track_data_.id;
+  } else {
+    next_level = ExpandHeader(key.header, key.item);
+  }
+
+  out_.emplace_back(key, value);
+
+  if (next_level) {
+    handleLevel(*next_level, components.subspan(1));
+  }
+}
+
+auto Index(locale::ICollator& collator,
+           const IndexInfo& index,
+           const TrackData& data,
+           const TrackTags& tags)
+    -> std::vector<std::pair<IndexKey, std::string>> {
+  if (index.type != data.type && index.type != MediaType::kAny) {
+    return {};
+  }
+  Indexer indexer{collator, index, data, tags};
+  return indexer.index();
+}
+
+auto ExpandHeader(const IndexKey::Header& header,
+                  const std::pmr::string& component) -> IndexKey::Header {
+  IndexKey::Header ret{header};
+  ret.components_hash.push_back(
+      komihash(component.data(), component.size(), 0));
+  return ret;
+}
+
+}  // namespace database

@@ -1,0 +1,2 @@
+source /workspaces/mp3_esp32_fw/build/gdbinit/symbols
+source /workspaces/mp3_esp32_fw/build/gdbinit/connect

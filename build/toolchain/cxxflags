@@ -1,0 +1,8 @@
+-Wno-frame-address
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero
+-mdisable-hardware-atomics
+"-specs=/workspaces/mp3_esp32_fw/build/specs/picolibc.specs"
+-fno-rtti
